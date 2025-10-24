@@ -2,7 +2,6 @@ from dotenv import load_dotenv
 from supabase import Client
 import httpx
 import os
-from dhanserv import DhanHQService
 
 load_dotenv()
 
@@ -11,10 +10,6 @@ DHAN_ACCESS_TOKEN: str = os.environ.get("DHAN_ACCESS_TOKEN")
 
 if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
     raise RuntimeError("DhanHQ Client ID or Access Token not set.")
-
-# --- Initialize Service Globally ---
-dhan_service = DhanHQService(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-
 
 # --- Supabase Auth Service ---
 

@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
-from data import TradeCard, LivePriceRequest, SubscriptionRequest
+from data import TradeCard, LivePriceRequest, SubscriptionRequest, BulkSubscribeRequest
 from services import (
     verify_supabase_jwt,
     get_subscribers_for_advisor,
@@ -683,6 +683,73 @@ async def subscribe_instrument(req: SubscriptionRequest, request: Request):
         logger.error(f"Failed to publish subscription request: {e}")
         raise HTTPException(status_code=500, detail="Failed to queue subscription.")
 
+
+@app.post("/bulk-subscribe")
+async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
+    """
+    Endpoint for Flutter app to request multiple live data subscriptions.
+    Publishes individual messages for each symbol to the dhan_worker via Redis Pub/Sub.
+    """
+    if not redis_client:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis client not available. Cannot process bulk subscriptions."
+        )
+
+    successful_symbols = []
+    failed_symbols = []
+    channel = "signaldesk:subscriptions" # The channel worker listens to
+
+    logger.info(f"Received bulk request: Action='{request.action}', Symbols={request.symbols}")
+
+    for symbol in request.symbols:
+        security_id = symbol_to_security_id.get(symbol)
+        if not security_id:
+            logger.warning(f"Security ID not found for symbol: {symbol} during bulk subscribe. Skipping.")
+            failed_symbols.append({"symbol": symbol, "reason": "Security ID not found"})
+            continue
+
+        # Create the message payload, matching the single subscribe endpoint
+        message = {
+            "action": request.action,
+            "security_id": security_id
+        }
+
+        try:
+            # Publish the message for this specific instrument
+            redis_client.publish(channel, json.dumps(message))
+            logger.info(f"Published '{request.action}' request for {symbol} ({security_id}) to {channel}")
+            successful_symbols.append(symbol)
+
+        except redis.exceptions.ConnectionError as e:
+            logger.error(f"Redis connection error publishing for {symbol}: {e}")
+            failed_symbols.append({"symbol": symbol, "reason": "Redis connection error"})
+            # Optionally break or raise if Redis is critical
+            # raise HTTPException(status_code=503, detail="Redis connection failed during bulk publish.")
+        except Exception as e:
+            logger.error(f"Failed to publish subscription request for {symbol}: {e}")
+            failed_symbols.append({"symbol": symbol, "reason": str(e)})
+
+    # Construct the response based on results
+    if not failed_symbols:
+        return {
+            "status": "success",
+            "message": f"Successfully queued {request.action} requests for {len(successful_symbols)} instruments."
+        }
+    elif not successful_symbols:
+         raise HTTPException(
+             status_code=500,
+             detail=f"Failed to queue {request.action} requests for all instruments.",
+             headers={"X-Failed-Symbols": json.dumps(failed_symbols)} # Optional header
+         )
+    else:
+        # Partial success
+        return {
+            "status": "partial_success",
+            "message": f"Queued {request.action} for {len(successful_symbols)} instruments. Failed for {len(failed_symbols)}.",
+            "successful": successful_symbols,
+            "failed": failed_symbols
+        }
 
 @app.get("/get-stock-data/{symbol}")
 async def get_stock_data(symbol: str):

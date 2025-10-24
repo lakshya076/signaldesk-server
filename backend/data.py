@@ -24,3 +24,7 @@ class LivePriceRequest(BaseModel):
 class SubscriptionRequest(BaseModel):
     symbol: str
     action: str = "add"
+
+class BulkSubscribeRequest(BaseModel):
+    symbols: List[str]
+    action: str
