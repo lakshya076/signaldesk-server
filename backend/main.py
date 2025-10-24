@@ -17,7 +17,7 @@ from typing import Optional, Dict
 import logging
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -603,40 +603,94 @@ async def get_live_prices(request_data: LivePriceRequest):
 @app.get("/get-all-stocks")
 async def get_all_stocks():
     """
-    Fetch complete stock list with REAL-TIME prices from Redis.
-    Used for search screen in Flutter app.
+    Fetch complete stock list with data primarily from Redis.
     """
+    if not redis_client:
+        logger.warning("get_all_stocks: Redis client not available")
+        raise HTTPException(status_code=503, detail="Market data connection is down.")
+
     all_stocks_data = {}
 
-    # Get all symbols
-    all_symbols = list(stock_metadata.keys())
+    redis_batch_data = {}  # To store results from pipeline
+    processed_count = 0  # To count stocks with Redis data
 
-    # Fetch live prices for all
-    live_prices_batch = get_multiple_live_prices(all_symbols[:500])  # Limit to 500 for performance
+    logger.info("get_all_stocks: Starting fetch...")
 
+    try:
+        # Prepare pipeline for HGETALL
+        pipeline = redis_client.pipeline()
+        security_id_to_symbol = {}
+
+        logger.info(f"get_all_stocks: Preparing pipeline for {len(stock_metadata)} stocks...")
+        for symbol, metadata in stock_metadata.items():
+            security_id = metadata.get('security_id')
+            if security_id:
+                redis_key = get_redis_key(security_id)
+                pipeline.hgetall(redis_key)
+                security_id_to_symbol[security_id] = symbol  # Store mapping
+
+        # Execute the pipeline to get all hash data at once
+        logger.info("get_all_stocks: Executing Redis pipeline...")
+        pipeline_results = pipeline.execute()
+        logger.info(f"get_all_stocks: Pipeline execution complete. Received {len(pipeline_results)} results.")
+
+        # Process pipeline results into a usable dictionary
+        expected_keys = list(security_id_to_symbol.keys())  # Order should match pipeline queue order
+
+        if len(pipeline_results) != len(expected_keys):
+            logger.warning(
+                f"Pipeline result count ({len(pipeline_results)}) doesn't match expected key count ({len(expected_keys)}).")
+
+        # Iterate using the order of added keys to the pipeline
+        for i, data in enumerate(pipeline_results):
+            if i < len(expected_keys):  # Safety check
+                security_id = expected_keys[i]
+                if data:  # If Redis returned data for this key
+                    redis_batch_data[security_id] = data  # Store the hash data
+                    processed_count += 1
+            else:
+                logger.warning(f"Received more pipeline results ({i + 1}) than expected keys ({len(expected_keys)}).")
+                break
+
+        logger.info(f"get_all_stocks: Processed Redis data for {processed_count} security IDs.")
+
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"get_all_stocks: Redis connection error during pipeline: {e}")
+        raise HTTPException(status_code=503, detail="Market data connection error.")
+    except Exception as e:
+        logger.error(f"get_all_stocks: Error during Redis pipeline execution: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching market data.")
+
+    logger.info("get_all_stocks: Building final response...")  # Added log
+    # Loop through metadata as before
     for symbol, metadata in stock_metadata.items():
         stock_data = {
             "name": metadata['name'],
             "security_id": metadata.get('security_id', '')
         }
 
-        # Try to get live data
-        redis_data = get_stock_data_from_redis(symbol)
+        security_id = metadata.get('security_id')
+        redis_data = redis_batch_data.get(security_id)  # Get data from batch dictionary
 
-        if redis_data:
-            stock_data["entry_price"] = redis_data.get('prev_close', 0.0)
-            stock_data["last_price"] = redis_data.get('prev_close', 0.0)
-        else:
-            stock_data["entry_price"] = 0.0
-            stock_data["last_price"] = 0.0
+        prev_close = 0.0
+        if redis_data and 'prev_close' in redis_data:
+            try:
+                prev_close = float(redis_data['prev_close'])
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid prev_close '{redis_data['prev_close']}' for {symbol}, using 0.0")
+
+        stock_data["entry_price"] = prev_close
+        stock_data["last_price"] = prev_close
 
         all_stocks_data[symbol] = stock_data
+
+    logger.info(f"get_all_stocks: Finished building response for {len(all_stocks_data)} stocks.")  # Added log
 
     return {
         "status": "success",
         "data": all_stocks_data,
         "total_stocks": len(all_stocks_data),
-        "live_data_count": len(live_prices_batch)
+        "live_data_count": processed_count
     }
 
 
@@ -698,7 +752,7 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
 
     successful_symbols = []
     failed_symbols = []
-    channel = "signaldesk:subscriptions" # The channel worker listens to
+    channel = "signaldesk:subscriptions"  # The channel worker listens to
 
     logger.info(f"Received bulk request: Action='{request.action}', Symbols={request.symbols}")
 
@@ -737,11 +791,11 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
             "message": f"Successfully queued {request.action} requests for {len(successful_symbols)} instruments."
         }
     elif not successful_symbols:
-         raise HTTPException(
-             status_code=500,
-             detail=f"Failed to queue {request.action} requests for all instruments.",
-             headers={"X-Failed-Symbols": json.dumps(failed_symbols)} # Optional header
-         )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to queue {request.action} requests for all instruments.",
+            headers={"X-Failed-Symbols": json.dumps(failed_symbols)}  # Optional header
+        )
     else:
         # Partial success
         return {
@@ -750,6 +804,7 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
             "successful": successful_symbols,
             "failed": failed_symbols
         }
+
 
 @app.get("/get-stock-data/{symbol}")
 async def get_stock_data(symbol: str):
