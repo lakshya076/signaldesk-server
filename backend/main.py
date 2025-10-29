@@ -15,6 +15,12 @@ import pandas as pd
 import redis
 from typing import Optional, Dict
 import logging
+import zoneinfo
+import datetime
+
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
+MARKET_OPEN_TIME = datetime.time(9, 15)
+MARKET_CLOSE_TIME = datetime.time(15, 30)
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', force=True)
@@ -832,6 +838,24 @@ async def check_market_status():
     A simple endpoint to check if the market is open.
     It checks the ltp_timestamp of a proxy stock.
     """
+    now_ist = datetime.datetime.now(IST)
+    current_time = now_ist.time()
+    current_day = now_ist.weekday()
+
+    is_weekday = current_day < 5
+
+    # Check if current time is within market hours
+    is_within_hours = MARKET_OPEN_TIME <= current_time <= MARKET_CLOSE_TIME
+
+    if not (is_weekday and is_within_hours):
+        logger.info(
+            f"Market status check failed (Time-based): Day={current_day}, Time={current_time}. Market is closed.")
+        raise HTTPException(
+            status_code=503,
+            detail="Market is closed (outside trading hours/days)."
+        )
+
+    # If inside market hours then check redis database which accounts for holidays too
     if not redis_client:
         raise HTTPException(
             status_code=503,
@@ -860,7 +884,7 @@ async def check_market_status():
             )
             raise HTTPException(
                 status_code=503,
-                detail="Market is closed."
+                detail="Market is closed (Checked Redis database)"
             )
 
         # If we passed all checks, the market is open
