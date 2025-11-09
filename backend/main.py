@@ -17,6 +17,7 @@ from typing import Optional, Dict
 import logging
 import zoneinfo
 import datetime
+from dhanhq import dhanhq
 
 IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 MARKET_OPEN_TIME = datetime.time(9, 15)
@@ -34,11 +35,16 @@ supabase_url: str = os.environ.get("URL")
 supabase_key: str = os.environ.get("SERVICE_KEY")
 supabase_anon_key: str = os.environ.get("ANON_KEY")
 
+# Dhan Configuration
+dhan_client_id: str = os.environ.get("DHAN_CLIENT_ID")
+dhan_access_token: str = os.environ.get("DHAN_ACCESS_TOKEN")
+
 # Redis Configuration
 REDIS_HOST = os.environ.get("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.environ.get("REDIS_PORT", 6379))
 REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", None)
 REDIS_DB = int(os.environ.get("REDIS_DB", 0))
+REDIS_DATA_TTL = int(os.environ.get("REDIS_DATA_TTL", 345600))
 MARKET_DATA_PREFIX = "marketdata:"
 
 MARKET_STATUS_PROXY_ID = "1333"
@@ -49,6 +55,8 @@ if not supabase_url or not supabase_key or not supabase_anon_key:
 
 # Initialize
 supabase: Client = create_client(supabase_url, supabase_key)
+
+dhan = dhanhq(dhan_client_id, dhan_access_token)
 
 # Initialize FastAPI
 app = FastAPI()
@@ -722,6 +730,88 @@ async def subscribe_instrument(req: SubscriptionRequest, request: Request):
         )
 
     # Create Pub/Sub Message
+    message = {
+        "action": req.action,
+        "security_id": security_id
+    }
+
+    try:
+        # Publish to the worker
+        channel = "signaldesk:subscriptions"
+        redis_client.publish(channel, json.dumps(message))
+
+        logger.info(f"Published {req.action} request for {req.symbol} ({security_id}) to {channel}")
+
+        return {
+            "status": "success",
+            "message": f"Subscription request for {req.symbol} queued."
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to publish subscription request: {e}")
+        raise HTTPException(status_code=500, detail="Failed to queue subscription.")
+
+
+@app.post("/backfill-subscribe")
+async def backfill_subscribe(req: SubscriptionRequest, request: Request):
+    security_id = symbol_to_security_id.get(req.symbol)
+    if not security_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Security ID not found for symbol: {req.symbol}"
+        )
+
+    if not redis_client:
+        raise HTTPException(
+            status_code=503,
+            detail="Redis client not available."
+        )
+
+    logger.info(f"Market closed. Backfilling historical data for {req.symbol}...")
+    try:
+        today = datetime.date.today()
+        from_date = str(today - datetime.timedelta(days=5))
+        to_date = str(today)
+
+        # Call Dhan API for historical data (this is a blocking call)
+        response = dhan.historical_daily_data(
+            security_id=str(security_id),
+            exchange_segment='NSE_EQ',
+            instrument_type='EQUITY',
+            from_date=from_date,
+            to_date=to_date
+        )
+
+        if response and response.get('status') == 'success' and response.get('data'):
+            ltp = response['data']['close'][-1]
+
+            try:
+                close = response['data']['close'][-2]
+            except Exception:
+                close = ltp
+
+            redis_key = get_redis_key(security_id)
+            pipe = redis_client.pipeline()
+
+            current_timestamp = int(time.time())
+
+            data_to_set = {
+                "prev_close": close,
+                "ltp": ltp,
+                "prev_close_timestamp": current_timestamp,
+                "ltp_timestamp": current_timestamp
+            }
+
+            pipe.hset(redis_key, mapping=data_to_set)
+            pipe.expire(redis_key, REDIS_DATA_TTL)
+            pipe.execute()
+            logger.info(f"✓ Backfilled {req.symbol}")
+        else:
+            logger.warning(f"Could not get historical data for {req.symbol}")
+
+    except Exception as e:
+        logger.error(f"Failed to backfill data for {req.symbol}: {e}")
+
     message = {
         "action": req.action,
         "security_id": security_id
