@@ -1,6 +1,6 @@
 pydantic~=2.12.4
 pandas~=2.3.3
-redis~=7.0.0
+redis~=7.0.1
 Booktype~=1.5
 fastapi~=0.121.1
 supabase~=2.24.0
