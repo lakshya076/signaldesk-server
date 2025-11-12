@@ -1,6 +1,7 @@
+import asyncio
 import json
 import time
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
+from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
@@ -12,8 +13,8 @@ from services import (
     fetch_all_paginated_data
 )
 import pandas as pd
-import redis
-from typing import Optional, Dict
+import redis, redis.asyncio as aioredis
+from typing import Optional, Dict, Set, List
 import logging
 import zoneinfo
 import datetime
@@ -46,6 +47,7 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", None)
 REDIS_DB = int(os.environ.get("REDIS_DB", 0))
 REDIS_DATA_TTL = int(os.environ.get("REDIS_DATA_TTL", 345600))
 MARKET_DATA_PREFIX = "marketdata:"
+MARKET_DATA_UPDATES_CHANNEL = f"{MARKET_DATA_PREFIX}updates"
 
 MARKET_STATUS_PROXY_ID = "1333"
 MARKET_OPEN_THRESHOLD_SECONDS = 600
@@ -79,6 +81,21 @@ except redis.exceptions.ConnectionError as e:
     logger.error(f"✗ Failed to connect to Redis: {e}")
     logger.warning("API will start but market data features will not work!")
     redis_client = None
+
+# Initialize async redis client
+try:
+    # Note: This client is used only for the async WebSocket endpoint
+    async_redis_client = aioredis.Redis(
+        host=REDIS_HOST,
+        port=REDIS_PORT,
+        db=REDIS_DB,
+        password=REDIS_PASSWORD,
+        decode_responses=True
+    )
+    logger.info(f"✓ Initialized Async Redis client for WebSockets")
+except Exception as e:
+    logger.error(f"✗ Failed to initialize Async Redis client: {e}")
+    async_redis_client = None
 
 # Load instruments CSV
 instrument_df = pd.read_csv("instruments.csv")
@@ -241,8 +258,165 @@ def get_stock_full_data(symbol: str) -> Optional[Dict]:
             change = ((result['ltp'] - result['prev_close']) / result['prev_close']) * 100
             result['change_pct'] = round(change, 2)
             result['change_abs'] = round(result['ltp'] - result['prev_close'], 2)
+        else:
+            # --- ADDED THIS ---
+            result['change_pct'] = 0.0
+            result['change_abs'] = 0.0
+
+    else:
+        # No live data, return a default structure
+        result.update({
+            "ltp": None,
+            "prev_close": 0.0,
+            "entry_price": 0.0,
+            "last_price": 0.0,
+            "ltp_timestamp": None,
+            "change_pct": 0.0,
+            "change_abs": 0.0
+        })
 
     return result
+
+
+active_subscriptions: Dict[WebSocket, Set[str]] = {}
+symbol_to_clients: Dict[str, Set[WebSocket]] = {}
+
+
+def _publish_to_worker(action: str, symbol: str):
+    """Helper to tell dhan_worker to subscribe/unsubscribe via Redis."""
+    security_id = symbol_to_security_id.get(symbol)
+    if not security_id or not redis_client:
+        logger.warning(f"WS: Cannot publish {action} for {symbol}: No security_id or redis_client")
+        return
+
+    message = {"action": action, "security_id": security_id}
+    try:
+        redis_client.publish("signaldesk:subscriptions", json.dumps(message))
+        logger.info(f"WS: Published {action} for {symbol} ({security_id}) to worker")
+    except Exception as e:
+        logger.error(f"WS: Failed to publish to worker: {e}")
+
+
+async def _subscribe_client(ws: WebSocket, symbols: List[str]):
+    """Subscribe a client to a list of symbols."""
+    if ws not in active_subscriptions:
+        active_subscriptions[ws] = set()
+
+    new_subscriptions = 0
+    for symbol in symbols:
+        if symbol not in symbol_to_security_id:
+            logger.warning(f"WS: Unknown symbol {symbol} in subscribe request")
+            continue
+
+        # Add to client's subscription set
+        active_subscriptions[ws].add(symbol)
+
+        # Add client to symbol's listener set
+        if symbol not in symbol_to_clients:
+            symbol_to_clients[symbol] = set()
+
+        # Only publish to worker if this is the FIRST client for this symbol
+        if not symbol_to_clients[symbol]:
+            _publish_to_worker("add", symbol)
+
+        if ws not in symbol_to_clients[symbol]:
+            symbol_to_clients[symbol].add(ws)
+            new_subscriptions += 1
+
+    logger.info(f"WS: Client {ws.client.host} subscribed to {new_subscriptions} new symbols.")
+
+
+async def _unsubscribe_client(ws: WebSocket, symbols: List[str]):
+    """Unsubscribe a client from a list of symbols."""
+    if ws not in active_subscriptions:
+        return
+
+    for symbol in symbols:
+        active_subscriptions[ws].discard(symbol)
+
+        if symbol in symbol_to_clients:
+            symbol_to_clients[symbol].discard(ws)
+
+            # If this was the LAST client for this symbol, tell worker to unsubscribe
+            if not symbol_to_clients[symbol]:
+                logger.info(f"WS: Last client for {symbol}. Telling worker to remove.")
+                _publish_to_worker("remove", symbol)
+                del symbol_to_clients[symbol]  # Clean up
+
+
+async def _disconnect_client(ws: WebSocket):
+    """Handle client disconnection."""
+    if ws in active_subscriptions:
+        symbols_to_remove = list(active_subscriptions.get(ws, set()))
+        await _unsubscribe_client(ws, symbols_to_remove)
+        del active_subscriptions[ws]
+        logger.info(f"WS: Client {ws.client.host} disconnected. Cleaned up {len(symbols_to_remove)} subscriptions.")
+
+
+# --- Redis Pub/Sub Listener for WebSocket ---
+
+async def redis_websocket_listener():
+    """
+    Listens to Redis Pub/Sub 'marketdata:updates' and forwards to WebSockets.
+    """
+    if not async_redis_client:
+        logger.error("WS Listener: Async Redis client not available. Cannot start listener.")
+        return
+
+    logger.info("WS Listener: Starting...")
+    while True:
+        try:
+            pubsub = async_redis_client.pubsub()
+            await pubsub.subscribe(MARKET_DATA_UPDATES_CHANNEL)
+            logger.info(f"WS Listener: Subscribed to Redis channel '{MARKET_DATA_UPDATES_CHANNEL}'")
+
+            while True:
+                message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+                if message is None:
+                    await asyncio.sleep(0.01)  # Prevent busy-looping
+                    continue
+
+                if message.get("type") == "message":
+                    try:
+                        data = json.loads(message["data"])
+                        security_id = data.get("security_id")
+                        update_data = data.get("data")  # This is the {'ltp': 123, ...}
+
+                        if not security_id or not update_data:
+                            continue
+
+                        symbol = security_id_to_symbol.get(str(security_id))
+                        if not symbol or symbol not in symbol_to_clients:
+                            continue
+
+                        clients_to_notify = list(symbol_to_clients[symbol])  # Copy set for safe iteration
+
+                        # Format the payload for the client
+                        payload = {"symbol": symbol}
+                        if 'ltp' in update_data:
+                            payload['ltp'] = update_data['ltp']
+                        if 'prev_close' in update_data:
+                            payload['prev_close'] = update_data['prev_close']
+
+                        tasks = [client.send_json(payload) for client in clients_to_notify if
+                                 client in active_subscriptions]
+                        if tasks:
+                            results = await asyncio.gather(*tasks, return_exceptions=True)
+                            for res, client in zip(results, clients_to_notify):
+                                if isinstance(res, Exception):
+                                    logger.warning(
+                                        f"WS Listener: Failed to send to {client.client.host}: {res}. Removing.")
+                                    await _disconnect_client(client)
+
+                    except Exception as e:
+                        logger.error(f"WS Listener: Error processing message: {e}")
+
+        except (aioredis.exceptions.ConnectionError, asyncio.TimeoutError) as e:
+            logger.error(f"WS Listener: Connection error: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logger.critical(f"WS Listener: CRITICAL error: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
 
 
 # --- API Endpoints
@@ -264,6 +438,9 @@ async def startup_event():
             logger.warning("✗ Redis connection: FAILED")
     else:
         logger.warning("✗ Redis client not initialized")
+
+    logger.info("Starting WebSocket Redis listener task...")
+    asyncio.create_task(redis_websocket_listener())
 
     logger.info("=" * 60)
 
@@ -311,6 +488,37 @@ def health_check():
         "redis": redis_ok,
         "supabase": True  # Assume OK if API started
     }
+
+
+@app.websocket("/ws/prices")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    logger.info(f"WS: Client connected from {websocket.client.host}")
+    active_subscriptions[websocket] = set()  # Register client
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            action = data.get("action")
+            symbols = data.get("symbols", [])
+
+            if not isinstance(symbols, list):
+                symbols = [symbols]  # Handle single symbol case
+
+            if action == "subscribe" or action == "bulk_subscribe":
+                await _subscribe_client(websocket, symbols)
+                await websocket.send_json({"status": "success", "message": f"Subscribed to {len(symbols)} symbols"})
+
+            elif action == "unsubscribe":
+                await _unsubscribe_client(websocket, symbols)
+                await websocket.send_json({"status": "success", "message": f"Unsubscribed from {len(symbols)} symbols"})
+
+    except WebSocketDisconnect:
+        logger.info(f"WS: Client {websocket.client.host} disconnected (WebSocketDisconnect).")
+    except Exception as e:
+        logger.error(f"WS: Error in websocket_endpoint: {e}")
+    finally:
+        await _disconnect_client(websocket)
 
 
 @app.post("/create-trade")
@@ -768,13 +976,17 @@ async def backfill_subscribe(req: SubscriptionRequest, request: Request):
         )
 
     logger.info(f"Market closed. Backfilling historical data for {req.symbol}...")
+
+    ltp = 0.0
+    close = 0.0
+
     try:
         today = datetime.date.today()
-        from_date = str(today - datetime.timedelta(days=5))
+        from_date = str(today - datetime.timedelta(days=7))
         to_date = str(today)
 
-        # Call Dhan API for historical data (this is a blocking call)
-        response = dhan.historical_daily_data(
+        # --- Call both APIs ---
+        response_daily = dhan.historical_daily_data(
             security_id=str(security_id),
             exchange_segment='NSE_EQ',
             instrument_type='EQUITY',
@@ -782,35 +994,67 @@ async def backfill_subscribe(req: SubscriptionRequest, request: Request):
             to_date=to_date
         )
 
-        if response and response.get('status') == 'success' and response.get('data'):
-            ltp = response['data']['close'][-1]
+        response_minute = dhan.intraday_minute_data(
+            security_id=str(security_id),
+            exchange_segment='NSE_EQ',
+            instrument_type='EQUITY',
+            from_date=from_date,
+            to_date=to_date,
+            interval=60
+        )
 
+        # Get Prev_Close from daily data (this is more reliable)
+        if response_daily and response_daily.get('status') == 'success' and response_daily.get('data'):
             try:
-                close = response['data']['close'][-2]
-            except Exception:
-                close = ltp
+                close = float(response_daily['data']['close'][-1])
+            except (IndexError, KeyError, TypeError, ValueError) as e:
+                logger.warning(f"Could not parse Prev_Close from daily data for {req.symbol}: {e}")
+                close = 0.0
 
-            redis_key = get_redis_key(security_id)
-            pipe = redis_client.pipeline()
+        # Get LTP (Last Traded Price) from minute data if available
+        if response_minute and response_minute.get('status') == 'success' and response_minute.get('data'):
+            try:
+                ltp = float(response_minute['data']['close'][-1])
+            except (IndexError, KeyError, TypeError, ValueError) as e:
+                logger.warning(f"Could not parse LTP from minute data for {req.symbol}: {e}")
+                ltp = 0.0
 
-            current_timestamp = int(time.time())
+        # Fallback Logic
+        # If we couldn't get LTP (e.g., weekend), use the latest daily close as a fallback
+        if ltp == 0.0 and close != 0.0:
+            logger.info(f"Using daily close ({close}) as LTP fallback for {req.symbol}")
+            ltp = close
 
-            data_to_set = {
-                "prev_close": close,
-                "ltp": ltp,
-                "prev_close_timestamp": current_timestamp,
-                "ltp_timestamp": current_timestamp
-            }
+        elif close == 0.0 and ltp != 0.0:
+            logger.warning(f"Using LTP ({ltp}) as Prev_Close fallback for {req.symbol}")
+            close = ltp
 
-            pipe.hset(redis_key, mapping=data_to_set)
-            pipe.expire(redis_key, REDIS_DATA_TTL)
-            pipe.execute()
-            logger.info(f"✓ Backfilled {req.symbol}")
-        else:
-            logger.warning(f"Could not get historical data for {req.symbol}")
+        if ltp == 0.0 and close == 0.0:
+            logger.error(f"Failed to get *any* price data for {req.symbol}. Writing 0.0.")
+
+        # Write to Redis
+        redis_key = get_redis_key(security_id)
+        pipe = redis_client.pipeline()
+        current_timestamp = int(time.time())
+
+        data_to_set = {
+            "prev_close": close,
+            "ltp": ltp,
+            "prev_close_timestamp": current_timestamp,
+            "ltp_timestamp": current_timestamp
+        }
+
+        pipe.hset(redis_key, mapping=data_to_set)
+        pipe.expire(redis_key, REDIS_DATA_TTL)
+        pipe.execute()
+        logger.info(f"✓ Backfilled {req.symbol} (LTP: {ltp}, Prev_Close: {close})")
 
     except Exception as e:
-        logger.error(f"Failed to backfill data for {req.symbol}: {e}")
+        logger.error(f"CRITICAL: Failed to backfill data for {req.symbol}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to backfill market data for {req.symbol}: {str(e)}"
+        )
 
     message = {
         "action": req.action,
@@ -838,7 +1082,7 @@ async def backfill_subscribe(req: SubscriptionRequest, request: Request):
 async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
     """
     Endpoint for Flutter app to request multiple live data subscriptions.
-    Publishes individual messages for each symbol to the dhan_worker via Redis Pub/Sub.
+    Publishes ONE message with a LIST of security IDs.
     """
     if not redis_client:
         raise HTTPException(
@@ -848,6 +1092,7 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
 
     successful_symbols = []
     failed_symbols = []
+    security_ids_to_process = []
     channel = "signaldesk:subscriptions"  # The channel worker listens to
 
     logger.info(f"Received bulk request: Action='{request.action}', Symbols={request.symbols}")
@@ -859,26 +1104,33 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
             failed_symbols.append({"symbol": symbol, "reason": "Security ID not found"})
             continue
 
-        # Create the message payload, matching the single subscribe endpoint
-        message = {
-            "action": request.action,
-            "security_id": security_id
+        security_ids_to_process.append(security_id)
+        successful_symbols.append(symbol)
+
+    if not security_ids_to_process:
+        logger.warning("Bulk request had no valid symbols to process.")
+        return {
+            "status": "failed",
+            "message": "No valid symbols found to process.",
+            "failed": failed_symbols
         }
 
-        try:
-            # Publish the message for this specific instrument
-            redis_client.publish(channel, json.dumps(message))
-            logger.info(f"Published '{request.action}' request for {symbol} ({security_id}) to {channel}")
-            successful_symbols.append(symbol)
+    # Create one message with a LIST of security IDs
+    message = {
+        "action": request.action,
+        "security_ids": security_ids_to_process  # <-- PLURAL KEY
+    }
 
-        except redis.exceptions.ConnectionError as e:
-            logger.error(f"Redis connection error publishing for {symbol}: {e}")
-            failed_symbols.append({"symbol": symbol, "reason": "Redis connection error"})
-            # Optionally break or raise if Redis is critical
-            # raise HTTPException(status_code=503, detail="Redis connection failed during bulk publish.")
-        except Exception as e:
-            logger.error(f"Failed to publish subscription request for {symbol}: {e}")
-            failed_symbols.append({"symbol": symbol, "reason": str(e)})
+    try:
+        redis_client.publish(channel, json.dumps(message))
+        logger.info(f"Published '{request.action}' request for {len(security_ids_to_process)} instruments to {channel}")
+
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Redis connection error publishing bulk request: {e}")
+        raise HTTPException(status_code=503, detail="Redis connection failed during bulk publish.")
+    except Exception as e:
+        logger.error(f"Failed to publish bulk subscription request for {symbol}: {e}")
+        failed_symbols.append({"symbol": "N/A (Batch)", "reason": str(e)})
 
     # Construct the response based on results
     if not failed_symbols:
@@ -886,17 +1138,11 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
             "status": "success",
             "message": f"Successfully queued {request.action} requests for {len(successful_symbols)} instruments."
         }
-    elif not successful_symbols:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to queue {request.action} requests for all instruments.",
-            headers={"X-Failed-Symbols": json.dumps(failed_symbols)}  # Optional header
-        )
     else:
-        # Partial success
+        # Partial success (some symbols failed mapping)
         return {
             "status": "partial_success",
-            "message": f"Queued {request.action} for {len(successful_symbols)} instruments. Failed for {len(failed_symbols)}.",
+            "message": f"Queued {request.action} for {len(successful_symbols)} instruments. Failed to find {len(failed_symbols)}.",
             "successful": successful_symbols,
             "failed": failed_symbols
         }
