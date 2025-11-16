@@ -1313,3 +1313,23 @@ async def get_dashboard_stats(request: Request):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/get-instrument-list")
+async def get_instrument_list():
+    """
+    Fetch the complete static list of instruments (symbol, name, security_id).
+    This endpoint is lightweight and does NOT query Redis for live prices.
+    It's designed for client-side caching (e.g., search screen).
+    """
+    if not stock_metadata:
+        raise HTTPException(
+            status_code=503,
+            detail="Instrument list is not loaded."
+        )
+
+    return {
+        "status": "success",
+        "data": stock_metadata,
+        "total_stocks": len(stock_metadata)
+    }
