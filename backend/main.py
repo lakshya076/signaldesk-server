@@ -1333,3 +1333,45 @@ async def get_instrument_list():
         "data": stock_metadata,
         "total_stocks": len(stock_metadata)
     }
+
+
+# Approving Advisors
+@app.get("/admin/pending-advisors")
+async def get_pending_advisors(request: Request):
+    """Fetches advisors who are not yet verified."""
+    auth_header = request.headers.get('Authorization')
+    token = auth_header.split(" ")[1]
+    user = await verify_supabase_jwt(token, supabase)
+
+    if not user or user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        # Join profiles with advisor_details to get license info
+        response = supabase.table('profiles').select(
+            "id, email, first_name, last_name, advisor_details(license_type, registration_number)"
+        ).eq('role', 'advisor').eq('is_verified', False).execute()
+
+        return {"status": "success", "data": response.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/admin/approve-advisor/{advisor_id}")
+async def approve_advisor(advisor_id: str, request: Request):
+    """Sets is_verified to true for a specific advisor."""
+    auth_header = request.headers.get('Authorization')
+    token = auth_header.split(" ")[1]
+    user = await verify_supabase_jwt(token, supabase)
+
+    if not user or user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail="Admin access required")
+
+    try:
+        response = supabase.table('profiles').update(
+            {"is_verified": True}
+        ).eq('id', advisor_id).execute()
+
+        return {"status": "success", "message": "Advisor approved successfully"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
