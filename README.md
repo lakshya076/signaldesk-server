@@ -32,23 +32,118 @@ Dhan feed / mock feed ──► redis-worker ──► Redis ──► backend (
 | `backend/` | FastAPI service: REST endpoints, role checks, rate limiting, WebSocket price fan-out |
 | `redis-worker/` | Market-data worker. `dhan_worker.py` subscribes on demand; `dhan_worker_1.py` / `_2.py` cover the whole NSE list split across two feed connections (Dhan allows 5,000 instruments per connection) |
 | `bench/` | WebSocket latency benchmark |
+| `supabase/` | Database schema and migrations (see [Database](#database-supabase)) |
 
-## Run locally
+## Run the whole system
 
-Needs Python 3.12 and Redis.
+SignalDesk is two repos: [signaldesk-server](https://github.com/lakshya076/signaldesk-server) (backend + market-data worker) and [signaldesk-apps](https://github.com/lakshya076/signaldesk-apps) (Flutter apps). Clone both side by side. You need Python 3.12, Docker (for Redis), Flutter 3.47 or newer, and a Supabase project.
+
+Start things in this order: Supabase (once), Redis, backend, worker, then any of the apps.
+
+### 1. Supabase (once)
+
+1. Create a project at [supabase.com](https://supabase.com).
+2. In the SQL editor, run `signaldesk-server/supabase/schema.sql`, then each file in `signaldesk-server/supabase/migrations/` in name order.
+3. From **Project Settings → API keys**, copy the project URL, the publishable key and the secret (service role) key.
+4. Create `signaldesk-server/backend/.env`:
+
+   ```
+   URL=https://<project-ref>.supabase.co
+   SERVICE_KEY=<secret key>
+   ANON_KEY=<publishable key>
+   ```
+
+   The secret key bypasses row level security, so keep it on the server; `.env` is gitignored.
+
+### 2. Redis, backend and worker
+
+Use one terminal per long-running command.
+
+**Linux / macOS (bash)**
 
 ```bash
+# Terminal 1: Redis, then the backend
 docker run -d --rm --name redis -p 6379:6379 redis:7-alpine
+cd signaldesk-server/backend
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt pytest
+.venv/bin/uvicorn main:app --port 8000
 
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --port 8000
+# Terminal 2: market-data worker on the simulated feed
+cd signaldesk-server/redis-worker
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+FEED_MODE=mock MOCK_TICKS_PER_SEC=50 .venv/bin/python dhan_worker.py
 
-cd redis-worker
-pip install -r requirements.txt
-FEED_MODE=mock python dhan_worker.py      # simulated ticks
-python dhan_worker.py                      # real Dhan feed (needs DHAN_* variables)
+# Check: should print "status":"healthy"
+curl localhost:8000/health
 ```
+
+**Windows (PowerShell)**
+
+```powershell
+# Window 1: Redis, then the backend
+docker run -d --rm --name redis -p 6379:6379 redis:7-alpine
+cd signaldesk-server\backend
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt pytest
+.venv\Scripts\python -m uvicorn main:app --port 8000
+
+# Window 2: market-data worker on the simulated feed
+cd signaldesk-server\redis-worker
+py -3.12 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+$env:FEED_MODE = "mock"; $env:MOCK_TICKS_PER_SEC = "50"
+.venv\Scripts\python dhan_worker.py
+
+# Check: should print "status":"healthy" (curl.exe, because "curl" is a different command in Windows PowerShell)
+curl.exe localhost:8000/health
+```
+
+Use Python 3.12: some dependencies (pandas) may not ship packages for newer versions yet. If `py` isn't available, `uv venv -p 3.12 .venv` works too. Calling `.venv\Scripts\python` directly avoids PowerShell's script-execution policy blocking `Activate.ps1`.
+
+`MOCK_TICKS_PER_SEC=50` feels like a real market in the apps; raise it (for example to 500) for load testing.
+
+### 3. The apps
+
+```bash
+cd signaldesk-apps/user          # or advisor / admin  (Windows: cd signaldesk-apps\user)
+flutter pub get
+flutter run -d windows --dart-define=API_BASE_URL=http://localhost:8000
+```
+
+- Device: `-d windows`, `-d linux`, `-d macos` for a desktop app, `-d chrome` for the browser (no extra setup), or a connected phone or emulator. Desktop builds need the platform toolchain (on Windows, Visual Studio's "Desktop development with C++"); `flutter doctor` shows what's missing.
+- Android emulator: use `API_BASE_URL=http://10.0.2.2:8000` (the emulator's address for your computer).
+- Your own Supabase project: add `--dart-define=SUPABASE_URL=https://<project-ref>.supabase.co --dart-define=SUPABASE_ANON_KEY=<publishable key>`.
+- Run several apps at once by starting each from its own terminal.
+
+### 4. Accounts
+
+1. Sign up in the **advisor** app and in the **user** app (confirm the email if your Supabase project requires it).
+2. There is no admin sign-up, on purpose. Sign up any account, then in the Supabase table editor set its `role` in `profiles` to `admin`.
+3. Sign in to the **admin** app and approve the advisor. Advisors can't create trades until approved.
+4. In the **user** app, subscribe to the advisor to see their trades.
+
+### 5. Market hours
+
+The backend treats the market as open Monday to Friday, 9:15 to 15:30 IST (NSE hours), and only allows creating trades then. Outside those hours, adding a stock to the watchlist asks Dhan for the last prices, which needs Dhan credentials; without them that step fails. Test the trading flows during market hours.
+
+### 6. Tests and benchmark
+
+```bash
+# Backend tests (Redis must be running). Windows: .venv\Scripts\python -m pytest test_rate_limit.py
+cd signaldesk-server/backend && .venv/bin/pytest test_rate_limit.py
+
+# Latency benchmark (backend and worker running). Windows: backend\.venv\Scripts\python bench\ws_latency.py ...
+cd signaldesk-server && backend/.venv/bin/python bench/ws_latency.py --symbols 200 --clients 10 --seconds 30
+
+# App tests, in each of advisor/, user/, admin/
+cd signaldesk-apps/user && flutter test
+```
+
+Stop everything with Ctrl+C in each terminal, then `docker stop redis`.
+
+## Settings
 
 Settings come from environment variables or a `.env` file in each folder:
 
@@ -62,13 +157,38 @@ Settings come from environment variables or a `.env` file in each folder:
 | `MOCK_TICKS_PER_SEC` | worker | Total simulated ticks per second (default 50) |
 | `RATE_LIMIT_PER_MIN` | backend | Default requests per minute per client IP (default 120) |
 
+## Database (Supabase)
+
+`supabase/schema.sql` is the full public schema (tables, constraints, functions, triggers, row level security policies), pulled from the production project. `supabase/migrations/` holds changes on top of it; apply them in name order.
+
+| Table | Holds |
+|---|---|
+| `profiles` | One row per account: role (`user`, `advisor`, `admin`), name, contact details, `is_verified` for advisors |
+| `advisor_details`, `user_details` | Role-specific details (advisor licence type and registration number) |
+| `trade_cards` | Trade signals: stock, direction, entry, target, stop loss, status, close price |
+| `subscriptions` | Which users follow which advisors |
+| `watchlists` | Each advisor's watched stocks |
+| `advisor_statistics` | Follower count, closed trades and hit rate per advisor, kept up to date by triggers |
+| `platform_statistics` | Single-row dashboard numbers for the admin app, kept up to date by triggers |
+
+Access rules (row level security):
+
+- Signed-out clients can't read or write any table; sign-up goes through Supabase Auth, and a trigger creates the profile.
+- Sign-up can only create `user` or `advisor` accounts. Admins are promoted by hand.
+- Signed-in users see their own profile and advisors' public profile fields, never other people's phone numbers. They can edit only their name and phone number, not their role or verification.
+- Advisors see and manage only their own trades and watchlist; only advisors approved by an admin can create trades.
+- Users see trades only from advisors they subscribe to.
+- Statistics tables are read-only for clients and written by triggers.
+
+The backend uses the secret key, which bypasses these rules, so it checks roles and advisor approval itself before acting.
+
 ## API
 
 | Endpoint | Auth | Purpose |
 |---|---|---|
 | `GET /`, `GET /health` | – | Service info and Redis health |
 | `WS /ws/prices` | – | Send `{"action": "subscribe", "symbols": [...]}`; receive `{"symbol", "ltp", "prev_close", "ts"}` per tick |
-| `POST /create-trade` | advisor | Create a trade card at the live price (market hours only) |
+| `POST /create-trade` | approved advisor | Create a trade card at the live price (market hours only) |
 | `GET /check-market-status` | – | Open or closed, from trading hours and feed freshness |
 | `POST /get-live-prices` | – | Latest prices for a list of symbols |
 | `GET /get-stock-data/{symbol}` | – | Price, previous close and change for one stock |
