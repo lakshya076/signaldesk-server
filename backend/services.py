@@ -33,12 +33,13 @@ async def verify_supabase_jwt(token: str, supabase: Client) -> dict:
 
             # 2. Fetch the user's role from your public 'profiles' table
             print("\n--- Fetching profile from database ---")
-            profile_res = supabase.table('profiles').select('id, role').eq('id', user_data['id']).single().execute()
+            profile_res = supabase.table('profiles').select('id, role, is_verified').eq('id', user_data['id']).single().execute()
 
             print(f"Step 2: Database query result: {profile_res.data}")
 
             if profile_res.data:
                 user_data['role'] = profile_res.data.get('role')
+                user_data['is_verified'] = profile_res.data.get('is_verified', False)
                 user_data['id'] = user_data.get('id')
                 print(f"Step 2 SUCCESS: Found profile. Assigned role: '{user_data['role']}'")
                 print("------------------------\n")

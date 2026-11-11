@@ -608,6 +608,9 @@ async def create_trade(trade_data: TradeCard, request: Request):
     """
     # Authenticate first, so unauthenticated callers can't probe market or feed state
     user = await require_role(request, 'advisor')
+    # Trades are inserted with the service key, which skips RLS, so enforce admin approval here too
+    if not user.get('is_verified'):
+        raise HTTPException(status_code=403, detail="Advisor account is awaiting admin approval.")
 
     if not redis_client:
         raise HTTPException(
