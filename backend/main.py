@@ -1,7 +1,9 @@
 import asyncio
+import collections
 import json
 import time
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from supabase import create_client, Client
 import os
 from dotenv import load_dotenv
@@ -48,6 +50,7 @@ REDIS_DB = int(os.environ.get("REDIS_DB", 0))
 REDIS_DATA_TTL = int(os.environ.get("REDIS_DATA_TTL", 345600))
 MARKET_DATA_PREFIX = "marketdata:"
 MARKET_DATA_UPDATES_CHANNEL = f"{MARKET_DATA_PREFIX}updates"
+SUBSCRIPTIONS_CHANNEL = "signaldesk:subscriptions"  # the redis-worker listens here
 
 MARKET_STATUS_PROXY_ID = "1333"
 MARKET_OPEN_THRESHOLD_SECONDS = 600
@@ -58,10 +61,22 @@ if not supabase_url or not supabase_key or not supabase_anon_key:
 # Initialize
 supabase: Client = create_client(supabase_url, supabase_key)
 
-dhan = dhanhq(dhan_client_id, dhan_access_token)
+# Dhan is only needed for /backfill-subscribe; live prices come from the redis-worker.
+dhan = dhanhq(dhan_client_id, dhan_access_token) if dhan_client_id and dhan_access_token else None
 
 # Initialize FastAPI
 app = FastAPI()
+
+
+async def require_role(request: Request, role: str) -> dict:
+    """Return the caller's profile if their Supabase JWT is valid and has `role`, else raise 401/403."""
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
+    user = await verify_supabase_jwt(auth_header.split(" ", 1)[1], supabase)
+    if not user or user.get('role') != role:
+        raise HTTPException(status_code=403, detail=f"Permission denied. {role.capitalize()} role required.")
+    return user
 
 # Initialize Redis
 try:
@@ -96,6 +111,52 @@ try:
 except Exception as e:
     logger.error(f"✗ Failed to initialize Async Redis client: {e}")
     async_redis_client = None
+
+# --- Rate limiting ---
+# Requests per minute per client IP, counted in Redis so every server process shares one count.
+# The first prefix that matches wins; all other endpoints share the default bucket.
+# Behind a proxy (Cloudflare, Render, ngrok) run uvicorn with --proxy-headers --forwarded-allow-ips=<proxy IP>,
+# otherwise every client looks like the proxy and shares one limit.
+RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", 120))
+RATE_LIMITS = {
+    "/backfill-subscribe": 10,  # each call makes two Dhan API requests
+    "/get-all-stocks": 10,      # reads ~8,500 Redis keys
+    "/check-trade-cards": 10,   # scheduler endpoints
+    "/update-last-price": 10,
+    "/create-trade": 20,
+    "/admin/": 60,
+    "/ws/prices": 20,           # new WebSocket connections
+}
+WS_MESSAGES_PER_MIN = 60        # subscribe/unsubscribe messages per WebSocket connection
+
+
+async def rate_limit_retry_after(client_ip: str, path: str) -> int:
+    """Count one request. Return seconds until the client may retry if it is over its limit, else 0."""
+    bucket, limit = next(((p, n) for p, n in RATE_LIMITS.items() if path.startswith(p)),
+                         ("default", RATE_LIMIT_PER_MIN))
+    if not async_redis_client:
+        return 0
+    # shortcut: fixed 60 s windows allow up to 2x the limit across a window boundary; use a sliding window if that matters
+    key = f"ratelimit:{bucket}:{client_ip}:{int(time.time() // 60)}"
+    try:
+        pipe = async_redis_client.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, 60, nx=True)
+        count, _ = await pipe.execute()
+    except Exception as e:
+        logger.warning(f"Rate limit check skipped, Redis error: {e}")
+        return 0  # fail open: a Redis outage already degrades prices, don't also block every request
+    return 60 - int(time.time()) % 60 if count > limit else 0
+
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    retry_after = await rate_limit_retry_after(request.client.host if request.client else "unknown", request.url.path)
+    if retry_after:
+        return JSONResponse(status_code=429, content={"detail": "Too many requests. Try again later."},
+                            headers={"Retry-After": str(retry_after)})
+    return await call_next(request)
+
 
 # Load instruments CSV
 instrument_df = pd.read_csv("instruments.csv")
@@ -291,7 +352,7 @@ def _publish_to_worker(action: str, symbol: str):
 
     message = {"action": action, "security_id": security_id}
     try:
-        redis_client.publish("signaldesk:subscriptions", json.dumps(message))
+        redis_client.publish(SUBSCRIPTIONS_CHANNEL, json.dumps(message))
         logger.info(f"WS: Published {action} for {symbol} ({security_id}) to worker")
     except Exception as e:
         logger.error(f"WS: Failed to publish to worker: {e}")
@@ -389,7 +450,8 @@ async def redis_websocket_listener():
                         if not symbol or symbol not in symbol_to_clients:
                             continue
 
-                        clients_to_notify = list(symbol_to_clients[symbol])  # Copy set for safe iteration
+                        # Copy for safe iteration; filter before zipping so results line up with clients
+                        clients_to_notify = [c for c in symbol_to_clients[symbol] if c in active_subscriptions]
 
                         # Format the payload for the client
                         payload = {"symbol": symbol}
@@ -397,9 +459,10 @@ async def redis_websocket_listener():
                             payload['ltp'] = update_data['ltp']
                         if 'prev_close' in update_data:
                             payload['prev_close'] = update_data['prev_close']
+                        if 'ts' in data:
+                            payload['ts'] = data['ts']  # when the worker received the tick
 
-                        tasks = [client.send_json(payload) for client in clients_to_notify if
-                                 client in active_subscriptions]
+                        tasks = [client.send_json(payload) for client in clients_to_notify]
                         if tasks:
                             results = await asyncio.gather(*tasks, return_exceptions=True)
                             for res, client in zip(results, clients_to_notify):
@@ -492,13 +555,29 @@ def health_check():
 
 @app.websocket("/ws/prices")
 async def websocket_endpoint(websocket: WebSocket):
+    # HTTP middleware doesn't see WebSockets, so limit new connections here.
+    if await rate_limit_retry_after(websocket.client.host, "/ws/prices"):
+        await websocket.close(code=1008)  # rejects the handshake
+        return
+
     await websocket.accept()
     logger.info(f"WS: Client connected from {websocket.client.host}")
     active_subscriptions[websocket] = set()  # Register client
+    recent_messages = collections.deque()
 
     try:
         while True:
             data = await websocket.receive_json()
+
+            now = time.monotonic()
+            recent_messages.append(now)
+            while now - recent_messages[0] > 60:
+                recent_messages.popleft()
+            if len(recent_messages) > WS_MESSAGES_PER_MIN:
+                logger.warning(f"WS: {websocket.client.host} sent too many messages. Closing.")
+                await websocket.close(code=1008, reason="Too many messages")
+                break
+
             action = data.get("action")
             symbols = data.get("symbols", [])
 
@@ -527,6 +606,9 @@ async def create_trade(trade_data: TradeCard, request: Request):
     Endpoint to create a new trade card.
     Uses REAL-TIME prices from Redis.
     """
+    # Authenticate first, so unauthenticated callers can't probe market or feed state
+    user = await require_role(request, 'advisor')
+
     if not redis_client:
         raise HTTPException(
             status_code=503,
@@ -562,6 +644,8 @@ async def create_trade(trade_data: TradeCard, request: Request):
                 detail="Market is closed. Trade creation is disabled outside of market hours."
             )
 
+    except HTTPException:
+        raise  # the "market closed" 503s above; without this they turned into 500s
     except redis.exceptions.ConnectionError as e:
         logger.error(f"Redis connection error during market check: {e}")
         raise HTTPException(status_code=503, detail="Market data connection is down.")
@@ -571,16 +655,6 @@ async def create_trade(trade_data: TradeCard, request: Request):
             status_code=500,
             detail=f"Could not verify market status: {e}"
         )
-
-    # 1. Authenticate
-    auth_header = request.headers.get('Authorization')
-    if not auth_header or not auth_header.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Authorization header missing or invalid")
-
-    token = auth_header.split(" ")[1]
-    user = await verify_supabase_jwt(token, supabase)
-    if not user or user.get('role') != 'advisor':
-        raise HTTPException(status_code=403, detail="Permission denied. Advisor role required.")
 
     # Get real-time stock data from Redis
     stock_data = get_stock_full_data(trade_data.stock_symbol)
@@ -690,7 +764,7 @@ async def process_and_send_notifications(trade_record: dict, event_type: str):
 
 # Scheduler Endpoint
 @app.get("/check-trade-cards")
-async def check_trade_cards():
+def check_trade_cards():
     """
     Scheduler endpoint: Check open trades against REAL-TIME prices from Redis.
     Closes trades when target/stop-loss is hit.
@@ -761,7 +835,7 @@ async def check_trade_cards():
 
 # Scheduler Endpoint
 @app.get("/update-last-price")
-async def update_last_price():
+def update_last_price():
     """
     Scheduler endpoint: Update last_price for all open trades using REAL-TIME data.
     Run this once daily after market close.
@@ -806,7 +880,7 @@ async def update_last_price():
 
 
 @app.post("/get-live-prices")
-async def get_live_prices(request_data: LivePriceRequest):
+def get_live_prices(request_data: LivePriceRequest):
     """
     Fetch REAL-TIME live prices from Redis for multiple symbols.
     Called by Flutter app periodically.
@@ -823,7 +897,7 @@ async def get_live_prices(request_data: LivePriceRequest):
 
 
 @app.get("/get-all-stocks")
-async def get_all_stocks():
+def get_all_stocks():
     """
     Fetch complete stock list with data primarily from Redis.
     """
@@ -917,7 +991,7 @@ async def get_all_stocks():
 
 
 @app.post("/subscribe-instrument")
-async def subscribe_instrument(req: SubscriptionRequest, request: Request):
+def subscribe_instrument(req: SubscriptionRequest, request: Request):
     """
     Endpoint for Flutter app to request a live data subscription.
     This publishes a message to the dhan_worker via Redis Pub/Sub.
@@ -945,7 +1019,7 @@ async def subscribe_instrument(req: SubscriptionRequest, request: Request):
 
     try:
         # Publish to the worker
-        channel = "signaldesk:subscriptions"
+        channel = SUBSCRIPTIONS_CHANNEL
         redis_client.publish(channel, json.dumps(message))
 
         logger.info(f"Published {req.action} request for {req.symbol} ({security_id}) to {channel}")
@@ -961,7 +1035,7 @@ async def subscribe_instrument(req: SubscriptionRequest, request: Request):
 
 
 @app.post("/backfill-subscribe")
-async def backfill_subscribe(req: SubscriptionRequest, request: Request):
+def backfill_subscribe(req: SubscriptionRequest, request: Request):
     security_id = symbol_to_security_id.get(req.symbol)
     if not security_id:
         raise HTTPException(
@@ -974,6 +1048,9 @@ async def backfill_subscribe(req: SubscriptionRequest, request: Request):
             status_code=503,
             detail="Redis client not available."
         )
+
+    if not dhan:
+        raise HTTPException(status_code=503, detail="Backfill needs DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN.")
 
     logger.info(f"Market closed. Backfilling historical data for {req.symbol}...")
 
@@ -1063,7 +1140,7 @@ async def backfill_subscribe(req: SubscriptionRequest, request: Request):
 
     try:
         # Publish to the worker
-        channel = "signaldesk:subscriptions"
+        channel = SUBSCRIPTIONS_CHANNEL
         redis_client.publish(channel, json.dumps(message))
 
         logger.info(f"Published {req.action} request for {req.symbol} ({security_id}) to {channel}")
@@ -1079,7 +1156,7 @@ async def backfill_subscribe(req: SubscriptionRequest, request: Request):
 
 
 @app.post("/bulk-subscribe")
-async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
+def bulk_subscribe_instruments(request: BulkSubscribeRequest):
     """
     Endpoint for Flutter app to request multiple live data subscriptions.
     Publishes ONE message with a LIST of security IDs.
@@ -1093,7 +1170,7 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
     successful_symbols = []
     failed_symbols = []
     security_ids_to_process = []
-    channel = "signaldesk:subscriptions"  # The channel worker listens to
+    channel = SUBSCRIPTIONS_CHANNEL
 
     logger.info(f"Received bulk request: Action='{request.action}', Symbols={request.symbols}")
 
@@ -1149,7 +1226,7 @@ async def bulk_subscribe_instruments(request: BulkSubscribeRequest):
 
 
 @app.get("/get-stock-data/{symbol}")
-async def get_stock_data(symbol: str):
+def get_stock_data(symbol: str):
     """
     Fetch complete stock data including live prices and prev_close from Redis.
     Used by Flutter app for detailed stock information.
@@ -1169,7 +1246,7 @@ async def get_stock_data(symbol: str):
 
 
 @app.get("/check-market-status")
-async def check_market_status():
+def check_market_status():
     """
     A simple endpoint to check if the market is open.
     It checks the ltp_timestamp of a proxy stock.
@@ -1226,6 +1303,8 @@ async def check_market_status():
         # If we passed all checks, the market is open
         return {"status": "open", "message": "Market is open."}
 
+    except HTTPException:
+        raise  # keep the "market closed" 503s instead of turning them into 500s
     except redis.exceptions.ConnectionError:
         logger.error("Redis connection error during market check.")
         raise HTTPException(status_code=503, detail="Market data connection is down.")
@@ -1241,11 +1320,7 @@ async def get_admin_stats(request: Request):
     Admin dashboard stats.
     Requires admin JWT.
     """
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split(" ")[1]
-    user = await verify_supabase_jwt(token, supabase)
-    if not user or user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Permission denied. Admin role required.")
+    await require_role(request, 'admin')
 
     try:
         total_users = supabase.table('profiles').select('id', count='exact').execute().count
@@ -1270,11 +1345,7 @@ async def get_dashboard_stats(request: Request):
     """
     Fetches pre-aggregated statistics for admin panel.
     """
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split(" ")[1]
-    user = await verify_supabase_jwt(token, supabase)
-    if not user or user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Permission denied. Admin role required.")
+    await require_role(request, 'admin')
 
     try:
         stats_res = supabase.table('platform_statistics').select('*').eq('id', True).single().execute()
@@ -1311,12 +1382,14 @@ async def get_dashboard_stats(request: Request):
                 }
             }
         }
+    except HTTPException:
+        raise  # keep the 404 above
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/get-instrument-list")
-async def get_instrument_list():
+def get_instrument_list():
     """
     Fetch the complete static list of instruments (symbol, name, security_id).
     This endpoint is lightweight and does NOT query Redis for live prices.
@@ -1339,12 +1412,7 @@ async def get_instrument_list():
 @app.get("/admin/pending-advisors")
 async def get_pending_advisors(request: Request):
     """Fetches advisors who are not yet verified."""
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split(" ")[1]
-    user = await verify_supabase_jwt(token, supabase)
-
-    if not user or user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Admin access required")
+    await require_role(request, 'admin')
 
     try:
         # Join profiles with advisor_details to get license info
@@ -1360,12 +1428,7 @@ async def get_pending_advisors(request: Request):
 @app.post("/admin/approve-advisor/{advisor_id}")
 async def approve_advisor(advisor_id: str, request: Request):
     """Sets is_verified to true for a specific advisor."""
-    auth_header = request.headers.get('Authorization')
-    token = auth_header.split(" ")[1]
-    user = await verify_supabase_jwt(token, supabase)
-
-    if not user or user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail="Admin access required")
+    await require_role(request, 'admin')
 
     try:
         response = supabase.table('profiles').update(

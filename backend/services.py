@@ -5,12 +5,6 @@ import os
 
 load_dotenv()
 
-DHAN_CLIENT_ID: str = os.environ.get("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN: str = os.environ.get("DHAN_ACCESS_TOKEN")
-
-if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-    raise RuntimeError("DhanHQ Client ID or Access Token not set.")
-
 # --- Supabase Auth Service ---
 
 async def verify_supabase_jwt(token: str, supabase: Client) -> dict:
