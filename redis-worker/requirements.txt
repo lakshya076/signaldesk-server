@@ -1,0 +1,7 @@
+dhanhq==2.0.2
+# dhanhq 2.0.2's subscribe_symbols() reads ws.closed, which websockets 14+ removed.
+websockets>=12,<14
+redis~=7.0.1
+python-dotenv~=1.2.1
+pandas~=2.3.3
+requests>=2.32

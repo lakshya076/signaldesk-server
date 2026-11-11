@@ -109,27 +109,12 @@ class DhanRedisWorker:
                     pipe = self._redis_client.pipeline()
                     pipe.hset(redis_key, mapping=update_data)
                     pipe.expire(redis_key, self._data_ttl)  # Set TTL
+                    pipe.publish(f"{MARKET_DATA_PREFIX}updates", json.dumps({"security_id": sec_id, "data": update_data, "ts": time.time()}))
                     pipe.execute()
                     
                     self._stats['redis_writes'] += 1
                     self._stats['total_updates'] += 1
                     self._stats['last_update_time'] = time.time()
-
-                    # Publish the update to the 'marketdata:updates' channel
-                    # which main.py is listening to
-                    hotline_message = {
-                        "security_id": sec_id,
-                        "data": update_data
-                    }
-                    
-                    # Run publish in a thread-safe way
-                    if self._loop:
-                         self._loop.run_in_executor(
-                            None,
-                            self._redis_client.publish,
-                            f"{MARKET_DATA_PREFIX}updates",
-                            json.dumps(hotline_message)
-                        )
                     
                 except redis.exceptions.ConnectionError:
                     logging.error(f"Redis connection lost while writing {sec_id}")

@@ -19,8 +19,16 @@ REDIS_PASSWORD = os.environ.get("REDIS_PASSWORD", None)
 REDIS_DATA_TTL = int(os.environ.get("REDIS_DATA_TTL", 345600))
 REDIS_DB = int(os.environ.get("REDIS_DB", 0))
 
-if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-    raise RuntimeError("DhanHQ Client ID or Access Token not set.")
+# FEED_MODE=mock replaces the Dhan feed with simulated ticks (see mock_feed.py), so no API key is needed.
+FEED_MODE = os.environ.get("FEED_MODE", "dhan").lower()
+if FEED_MODE == "mock":
+    from mock_feed import MockFeed as FeedClass
+else:
+    FeedClass = marketfeed.DhanFeed
+    if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
+        raise RuntimeError("DhanHQ Client ID or Access Token not set. Use FEED_MODE=mock to run without them.")
+
+SUBSCRIPTIONS_CHANNEL = "signaldesk:subscriptions"
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s')
 
@@ -86,6 +94,7 @@ class DhanRedisWorker:
 
     def _process_data(self, data: Dict):
         """Extract LTP/prev_close and write to Redis."""
+        received_at = time.time()
         try:
             sec_id = str(data.get('security_id', ''))
             if not sec_id:
@@ -137,37 +146,24 @@ class DhanRedisWorker:
 
             if update_data:
                 try:
-                    # Use pipeline for atomic operation
+                    # One round trip: store, refresh TTL and publish in order. The publish used to go
+                    # through a thread pool, which could deliver ticks of one stock out of order.
+                    # "ts" is when this tick reached the worker; clients use it to measure latency.
+                    hotline_message = {"security_id": sec_id, "data": update_data, "ts": received_at}
                     pipe = self._redis_client.pipeline()
                     pipe.hset(redis_key, mapping=update_data)
-                    pipe.expire(redis_key, self._data_ttl)  # Set TTL
+                    pipe.expire(redis_key, self._data_ttl)
+                    pipe.publish(f"{MARKET_DATA_PREFIX}updates", json.dumps(hotline_message))
                     pipe.execute()
-                    
+
                     self._stats['redis_writes'] += 1
                     self._stats['total_updates'] += 1
                     self._stats['last_update_time'] = time.time()
 
-                    # Websocket migration
-                    hotline_message = {
-                        "security_id": sec_id,
-                        "data": update_data
-                    }
-                    # Publish the update to the new channel
-                    self._loop.run_in_executor(
-                        None,
-                        self._redis_client.publish,
-                        f"{MARKET_DATA_PREFIX}updates",
-                        json.dumps(hotline_message)
-                    )
-                    
                 except redis.exceptions.ConnectionError:
+                    # redis-py reconnects on the next command, so the next tick retries.
                     logging.error(f"Redis connection lost while writing {sec_id}")
                     self._stats['redis_errors'] += 1
-                    # Attempt reconnection
-                    try:
-                        self._loop.run_in_executor(None, self._redis_client.ping)
-                    except:
-                        logging.error("Redis reconnection failed")
                 except redis.exceptions.RedisError as e:
                     logging.error(f"Redis write error for {sec_id}: {e}")
                     self._stats['redis_errors'] += 1
@@ -263,7 +259,7 @@ class DhanRedisWorker:
                     self._stats['connection_attempts'] += 1
                     logging.info(f"Attempting connection for {len(current_instruments)} instruments...")
                     
-                    self._feed_client = marketfeed.DhanFeed(
+                    self._feed_client = FeedClass(
                         self._client_id, self._access_token, current_instruments, "v2"
                     )
                     logging.info(f"✓ Connected successfully with {len(current_instruments)} instruments")
@@ -465,8 +461,8 @@ class DhanRedisWorker:
 
         while not self._stop_event.is_set():
             try:
-                self._pubsub.subscribe("signaldesk:subscriptions")
-                logging.info("✓ Subscribed to 'signaldesk:subscriptions' channel.")
+                self._pubsub.subscribe(SUBSCRIPTIONS_CHANNEL)
+                logging.info(f"✓ Subscribed to '{SUBSCRIPTIONS_CHANNEL}' channel.")
 
                 for message in self._pubsub.listen():
                     if self._stop_event.is_set():
