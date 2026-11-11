@@ -37,6 +37,7 @@ async def main():
     ap.add_argument("--symbols", type=int, default=100, help="instruments each client subscribes to")
     ap.add_argument("--clients", type=int, default=1, help="concurrent WebSocket clients")
     ap.add_argument("--seconds", type=float, default=20)
+    ap.add_argument("--max-p99-ms", type=float, help="exit non-zero if p99 latency is above this (for CI)")
     args = ap.parse_args()
 
     with open(INSTRUMENTS, newline="", encoding="utf-8") as f:
@@ -52,6 +53,8 @@ async def main():
     print(f"{len(latencies)} messages to {args.clients} clients over {args.seconds:.0f}s "
           f"({len(latencies) / args.seconds:.0f} msg/s)")
     print(f"latency ms: p50 {q[49]:.2f} | p95 {q[94]:.2f} | p99 {q[98]:.2f} | max {max(latencies):.2f}")
+    if args.max_p99_ms is not None and q[98] > args.max_p99_ms:
+        raise SystemExit(f"p99 {q[98]:.2f} ms is above the {args.max_p99_ms:.0f} ms limit")
 
 
 if __name__ == "__main__":

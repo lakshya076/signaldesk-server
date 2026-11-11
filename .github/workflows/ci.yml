@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      # Placeholder Supabase settings: the tests and the benchmark don't call Supabase.
+      URL: http://localhost:54321
+      SERVICE_KEY: ci-placeholder
+      ANON_KEY: ci-placeholder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            backend/requirements.txt
+            redis-worker/requirements.txt
+
+      - name: Install backend
+        run: |
+          python -m venv .venv-backend
+          .venv-backend/bin/pip install -q -r backend/requirements.txt pytest
+      - name: Install worker
+        run: |
+          python -m venv .venv-worker
+          .venv-worker/bin/pip install -q -r redis-worker/requirements.txt
+
+      - name: Compile check
+        run: .venv-backend/bin/python -m compileall -q backend redis-worker bench
+
+      - name: Backend tests
+        working-directory: backend
+        run: ../.venv-backend/bin/pytest -q test_rate_limit.py
+
+      - name: End-to-end latency (mock feed)
+        run: |
+          (cd redis-worker && FEED_MODE=mock MOCK_TICKS_PER_SEC=300 ../.venv-worker/bin/python dhan_worker.py > ../worker.log 2>&1 &)
+          (cd backend && ../.venv-backend/bin/uvicorn main:app --port 8000 > ../backend.log 2>&1 &)
+          for i in $(seq 30); do curl -sf localhost:8000/health && break; sleep 1; done
+          # Sub-second budget, generous for shared CI runners
+          .venv-backend/bin/python bench/ws_latency.py --symbols 100 --clients 5 --seconds 15 --max-p99-ms 1000
+
+      - name: Service logs
+        if: always()
+        run: tail -n 40 worker.log backend.log || true
